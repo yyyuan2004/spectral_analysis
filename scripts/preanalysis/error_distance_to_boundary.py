@@ -1,29 +1,35 @@
-"""A4 -- Per-pixel error distance to the GT bruise boundary.
+"""A4 -- Per-pixel error distance to the GT bruise boundary + specular overlap.
 
 Purpose
 -------
-Show that segmentation errors are concentrated within a narrow boundary
-buffer around the ground-truth bruise edge.  This supports the argument
-that the inter-annotator agreement bound is the practical ceiling.
+1. Show that segmentation errors are concentrated within a narrow boundary
+   buffer around the ground-truth bruise edge (supports the argument that
+   the inter-annotator agreement bound is the practical ceiling).
+2. Quantify how much of the FP/FN mass falls inside specular highlight
+   regions of the apple, defined per-image as pixels exceeding the
+   per-channel p98 (configurable) of the 3 model-input channels, taken
+   within the apple region.
 
 Inputs
 ------
 * trained checkpoint (default ``../msi/outputs/baseline_seed42/checkpoints/best_model.pth``)
 * val split from the msi project (loaded via ``_adapters.get_val_loader``)
+* per-image apple region masks at ``<data-root>/whole/<stem>.npy``
+  (falls back to disk if the dataset's batch doesn't carry ``whole``)
 
 Outputs (under ``outputs/preanalysis/error_distance_to_boundary/``)
 ------------------------------------------------------------------
-* ``error_distance.json``         : aggregated stats + per-image counts
+* ``error_distance.json``         : aggregated stats, specular stats, per-image counts
 * ``error_distance_histograms.png``  : FP / FN histograms + CDFs
 * ``examples/<stem>.png``         : up to 9 example overlays
-* ``error_distance_report.txt``   : the headline numbers
+* ``error_distance_report.txt``   : the headline numbers + specular overlap section
 * ``error_distance_to_boundary.log``
 
 Typical runtime
 ---------------
 Inference is fast (a few minutes for ~55 val images on GPU).  Distance
-transform + plotting dominate.  Expect 10-30 minutes total, well under
-the 8 h budget.
+transform + specular percentile + plotting dominate.  Expect 10-30
+minutes total, well under the 8 h budget.
 """
 from __future__ import annotations
 
@@ -66,6 +72,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="cuda")
     p.add_argument("--n-examples", type=int, default=9,
                    help="Number of example overlay images to write")
+    p.add_argument("--specular-percentile", type=float, default=98.0,
+                   help="Per-channel percentile threshold (within whole_mask) "
+                        "for the specular highlight definition (default 98)")
     p.add_argument("--seed", type=int, default=SEED)
     return p.parse_args()
 
@@ -110,9 +119,17 @@ def main() -> int:
     fn_dists_all: list[np.ndarray] = []
     per_image: list[dict] = []
     example_payloads: list[dict] = []
+    spec_total_apple = 0
+    spec_total_specular = 0
+    spec_fp_in_specular = 0
+    spec_fn_in_specular = 0
+    spec_total_fp = 0
+    spec_total_fn = 0
+    spec_images_analysed = 0
+    spec_images_skipped = 0
 
     for idx, batch in enumerate(tqdm(loader, desc="inference")):
-        img, mask, _whole, stem = unpack_batch(batch)
+        img, mask, whole, stem = unpack_batch(batch)
         if img is None or mask is None:
             log.warning("skipping batch %d (missing fields)", idx)
             continue
@@ -149,6 +166,34 @@ def main() -> int:
         fp_dists_all.append(fp_d)
         fn_dists_all.append(fn_d)
 
+        # Specular reflection overlap analysis (within whole_mask)
+        whole_np = _resolve_whole_mask(whole, stem_str, args.data_root, gt_np.shape, log)
+        per_specular = None
+        if whole_np is not None:
+            specular_mask = _compute_specular_mask(img, whole_np, args.specular_percentile)
+            if specular_mask is not None:
+                spec_images_analysed += 1
+                apple_area = int(whole_np.sum())
+                spec_area = int(specular_mask.sum())
+                fp_in_spec = int((fp_mask & specular_mask).sum())
+                fn_in_spec = int((fn_mask & specular_mask).sum())
+                spec_total_apple += apple_area
+                spec_total_specular += spec_area
+                spec_fp_in_specular += fp_in_spec
+                spec_fn_in_specular += fn_in_spec
+                spec_total_fp += int(fp_mask.sum())
+                spec_total_fn += int(fn_mask.sum())
+                per_specular = {
+                    "apple_area": apple_area,
+                    "specular_area": spec_area,
+                    "fp_in_specular": fp_in_spec,
+                    "fn_in_specular": fn_in_spec,
+                }
+            else:
+                spec_images_skipped += 1
+        else:
+            spec_images_skipped += 1
+
         per_image.append({
             "stem": stem_str,
             "n_fp": int(fp_mask.sum()),
@@ -159,6 +204,7 @@ def main() -> int:
             "fn_within_3px": int((fn_d <= 3).sum()),
             "fn_within_5px": int((fn_d <= 5).sum()),
             "fn_within_10px": int((fn_d <= 10).sum()),
+            "specular": per_specular,
         })
 
         # Cache payload for example rendering
@@ -184,20 +230,30 @@ def main() -> int:
     log.info("aggregate FP=%d FN=%d", len(fp_all), len(fn_all))
 
     summary = _summarise(fp_all, fn_all)
+    specular_summary = _specular_summary(
+        spec_total_apple, spec_total_specular,
+        spec_total_fp, spec_total_fn,
+        spec_fp_in_specular, spec_fn_in_specular,
+        spec_images_analysed, spec_images_skipped,
+        args.specular_percentile,
+    )
     log.info("summary: %s", summary)
+    log.info("specular: %s", specular_summary)
 
     save_json({
         "config": {
             "checkpoint": args.checkpoint,
             "data_root": str(args.data_root),
             "band_indices": list(band_indices) if band_indices else [],
+            "specular_percentile": float(args.specular_percentile),
         },
         "summary": summary,
+        "specular": specular_summary,
         "per_image": per_image,
     }, out_dir / "error_distance.json")
 
     _plot_histograms(out_dir / "error_distance_histograms.png", fp_all, fn_all)
-    _write_report(out_dir / "error_distance_report.txt", summary)
+    _write_report(out_dir / "error_distance_report.txt", summary, specular_summary)
 
     # Render up to n_examples overlays (ranked by error count)
     example_payloads.sort(key=lambda d: -d["n_err"])
@@ -344,7 +400,7 @@ def _plot_example(path: Path, payload: dict) -> None:
     plt.close(fig)
 
 
-def _write_report(path: Path, summary: dict) -> None:
+def _write_report(path: Path, summary: dict, specular_summary: dict | None = None) -> None:
     lines = ["Error distance to GT boundary", "=" * 50, ""]
     for which in ("all", "fp", "fn"):
         s = summary[which]
@@ -357,7 +413,158 @@ def _write_report(path: Path, summary: dict) -> None:
         lines.append("")
     lines.append("Headline: X% of error pixels are within 3 pixels of the GT boundary "
                  f"-> {summary['all'].get('within_3px', 0):.1%}")
+
+    if specular_summary and specular_summary.get("images_analysed", 0) > 0:
+        lines.append("")
+        lines.append("-" * 50)
+        lines.append("Specular overlap analysis")
+        lines.append("-" * 50)
+        s = specular_summary
+        pct = s["percentile"]
+        lines.append(f"Definition: per-channel reflectance > p{pct:g} within whole_mask, "
+                     "AND across all 3 input channels.")
+        lines.append(f"Images analysed: {s['images_analysed']}  (skipped: {s['images_skipped']})")
+        lines.append("")
+        lines.append(f"- FP pixels within specular regions: {s['fp_in_specular_frac']:.1%}  "
+                     f"({s['fp_in_specular']:,} / {s['total_fp']:,} pixels)")
+        lines.append(f"- FN pixels within specular regions: {s['fn_in_specular_frac']:.1%}  "
+                     f"({s['fn_in_specular']:,} / {s['total_fn']:,} pixels)")
+        lines.append(f"- Specular regions cover {s['specular_frac_of_apple']:.1%} of total apple area  "
+                     f"({s['total_specular']:,} / {s['total_apple']:,} pixels)")
+        lines.append("")
+        lines.append(f"Interpretation: {s['interpretation']}")
+
     path.write_text("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# Specular reflection overlap helpers
+
+def _resolve_whole_mask(whole, stem_str: str, data_root: str, target_shape, log):
+    """Return a (H, W) uint8 mask from the batch field or fall back to disk."""
+    try:
+        import torch  # type: ignore
+        is_tensor = whole is not None and isinstance(whole, torch.Tensor)
+    except ImportError:
+        is_tensor = False
+
+    if whole is not None:
+        if is_tensor:
+            arr = whole.detach().cpu().numpy()
+        else:
+            arr = np.asarray(whole)
+        arr = np.squeeze(arr)
+        if arr.ndim == 2 and arr.shape == tuple(target_shape):
+            return (arr > 0).astype(np.uint8)
+        log.warning("unexpected whole shape from batch %s for %s; trying disk fallback",
+                    arr.shape, stem_str)
+
+    p = Path(data_root) / "whole" / f"{stem_str}.npy"
+    if not p.exists():
+        log.warning("whole mask not found at %s; skipping specular analysis for this image", p)
+        return None
+    try:
+        from _common import load_mask
+        arr = load_mask(p)
+    except Exception as e:  # noqa: BLE001
+        log.warning("failed to load whole mask %s: %s", p, e)
+        return None
+    if arr.shape != tuple(target_shape):
+        log.warning("whole-mask shape %s != gt shape %s for %s; skipping specular",
+                    arr.shape, target_shape, stem_str)
+        return None
+    return arr
+
+
+def _compute_specular_mask(img, whole_np: np.ndarray, percentile: float) -> np.ndarray | None:
+    """Compute the specular highlight mask within the apple region.
+
+    img: model input tensor / array, expected shape (1, C, H, W), (C, H, W), or (H, W, C).
+    whole_np: (H, W) uint8 in {0, 1}.
+    Returns (H, W) bool mask: pixels inside whole_mask where ALL C channels
+    exceed their per-channel p{percentile}.
+    """
+    try:
+        import torch  # type: ignore
+        is_tensor = isinstance(img, torch.Tensor)
+    except ImportError:
+        is_tensor = False
+
+    if is_tensor:
+        arr = img.detach().cpu().numpy()
+    else:
+        arr = np.asarray(img)
+    if arr.ndim == 4:
+        arr = arr[0]
+    if arr.ndim == 3:
+        # Heuristic: smaller of (axis 0) vs (axis -1) is channels
+        if arr.shape[0] < arr.shape[-1]:
+            arr = np.moveaxis(arr, 0, -1)
+    elif arr.ndim == 2:
+        arr = arr[..., None]
+    else:
+        return None
+    H, W, C = arr.shape
+    if (H, W) != whole_np.shape:
+        return None
+
+    whole_bool = whole_np > 0
+    if not whole_bool.any():
+        return None
+
+    specular = np.ones((H, W), dtype=bool)
+    for c in range(C):
+        vals = arr[:, :, c][whole_bool]
+        if vals.size == 0:
+            return None
+        thresh = float(np.percentile(vals, percentile))
+        specular &= (arr[:, :, c] > thresh)
+    specular &= whole_bool
+    return specular
+
+
+def _specular_summary(total_apple, total_specular, total_fp, total_fn,
+                      fp_in_specular, fn_in_specular,
+                      images_analysed, images_skipped, percentile) -> dict:
+    def _frac(n, d) -> float:
+        return float(n) / float(d) if d else 0.0
+
+    fp_frac = _frac(fp_in_specular, total_fp)
+    fn_frac = _frac(fn_in_specular, total_fn)
+    spec_frac = _frac(total_specular, total_apple)
+
+    if total_fp == 0 and total_fn == 0:
+        interp = "no FP/FN pixels were recorded -- inconclusive."
+    elif fp_frac >= 0.30:
+        interp = ("specular highlights are a major source of false positives; "
+                  "post-hoc masking of specular regions could meaningfully reduce FP.")
+    elif fp_frac >= 0.15:
+        interp = ("specular highlights contribute non-trivially to false positives; "
+                  "consider whether downstream rules can mitigate them.")
+    else:
+        interp = ("specular highlights are not the main driver of false positives; "
+                  "FPs are distributed across non-highlight apple regions.")
+    if fn_frac > 0.05:
+        interp += (f"  FN overlap with specular ({fn_frac:.1%}) is non-trivial -- "
+                   "some bruises may be saturated/occluded by highlights.")
+    else:
+        interp += f"  FN overlap with specular is small ({fn_frac:.1%}), as expected."
+
+    return {
+        "percentile": float(percentile),
+        "images_analysed": int(images_analysed),
+        "images_skipped": int(images_skipped),
+        "total_apple": int(total_apple),
+        "total_specular": int(total_specular),
+        "total_fp": int(total_fp),
+        "total_fn": int(total_fn),
+        "fp_in_specular": int(fp_in_specular),
+        "fn_in_specular": int(fn_in_specular),
+        "fp_in_specular_frac": fp_frac,
+        "fn_in_specular_frac": fn_frac,
+        "specular_frac_of_apple": spec_frac,
+        "interpretation": interp,
+    }
 
 
 if __name__ == "__main__":
