@@ -34,6 +34,7 @@ def run_training(
     epochs: int = 80,
     seed: int = 42,
     num_channels: int | None = None,
+    data_dir: str | Path | None = None,
     extra: dict[str, Any] | None = None,
 ) -> float:
     """Train a UNet on the given HSI band subset and return defect-class IoU.
@@ -51,6 +52,8 @@ def run_training(
     )
     if num_channels is not None:
         kwargs["num_channels"] = int(num_channels)
+    if data_dir is not None:
+        kwargs["data_dir"] = str(data_dir)
     if extra:
         kwargs.update(extra)
     return float(train_and_eval(**kwargs))
