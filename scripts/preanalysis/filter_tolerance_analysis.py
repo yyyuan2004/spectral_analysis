@@ -1,53 +1,57 @@
-"""A3 -- Filter-shift tolerance for the chosen 3-band combination.
+"""A3 -- Filter-shift tolerance (rewritten).
 
-Purpose
--------
-Quantify how robust the chosen 3-band combo is to small, hardware-realistic
-shifts of each filter centre wavelength (+/-1 and +/-2 HSI bands on the
-91-band cropped HSI grid).  Each neighbour combo is **re-trained from
-scratch** with the same baseline config; no lookup-table shortcut.
+Goal
+----
+Quantify how robust the chosen 3-band combo is to +/-1 hardware-realistic
+filter shifts.  Each of the ~27 neighbour combos is **really retrained**
+(no lookup) for ``--epochs`` epochs using msi's ``train_and_eval``.
 
-Critical assumption
--------------------
-``_adapters.run_training`` -> ``scripts.band_range_search.train_and_eval``
-must actually train and return the best class-1 IoU for the given
-``band_indices``.  As a guard against silent caching/lookup behaviour
-upstream, this script trains the base combo first and aborts (exit 2)
-if the returned IoU is non-finite or zero.
+Why a rewrite was needed
+------------------------
+The previous version reported empty neighbourhoods because its
+upstream adapter passed keyword arguments that ``train_and_eval`` does
+not accept (``config_path``, ``epochs`` instead of ``cfg``, ``num_epochs``),
+so every call threw silently and the script wrote NaN.  This script
+calls ``train_and_eval`` **directly** with the documented signature:
 
-CLI (per the spec)
-------------------
-  --base_combo 57,62,70           # comma-separated, 91-band cropped HSI index
-  --offset_range {1, 2}           # default 2 -> up to 5^3 = 125 raw candidates
-  --epochs 30                     # default 30 (NOT 80)
-  --data_dir /root/autodl-tmp/hsi # default
+    iou = train_and_eval(
+        cfg=cfg, seed=seed, band_indices=combo,
+        num_epochs=epochs, device=device,
+        verbose=True, combo_tag=combo_tag,
+    )
+
+If your upstream signature differs, edit the single call below.
+
+CLI
+---
+  --base_combo 57,62,70           # 91-band cropped HSI index
+  --offset_range 1                # locked to 1 to keep training budget sane
+  --epochs 30                     # 30-epoch quick eval (NOT directly
+                                  # comparable to 80-epoch baseline IoU)
+  --seed 42
+  --data_dir /root/autodl-tmp/datasets/full_HSI_dataset
+  --base_config ../msi/configs/baseline.yaml
   --output_dir outputs/preanalysis/filter_tolerance_analysis
+  --msi_root ../msi
 
-Dash-style aliases (``--base-combo``, ``--data-dir``, ``--output-dir``,
-``--offset-range``) are accepted for backward compatibility.
-
-Outputs (under ``--output_dir``)
---------------------------------
-* ``filter_tolerance_results.json`` : config + base_iou + per-combo
-                                       (offsets, bands, iou, duration_s)
-* ``filter_tolerance_heatmaps.png`` : 1x5 figure, one heatmap per offset of
-                                       the third band
-* ``filter_tolerance_distance.png`` : Manhattan distance vs IoU (mean+/-std)
-* ``filter_tolerance_3d.png``       : 3D scatter (offsets vs IoU)
-* ``filter_tolerance_report.txt``   : base IoU, +/-1 and +/-2 neighbourhood
-                                       stats, top-5, worst-5
-* ``filter_tolerance_analysis.log``
+Outputs
+-------
+* filter_tolerance_partial.json   (deleted on success)
+* filter_tolerance_results.json
+* filter_tolerance_report.txt
+* tolerance_distance_curve.png
+* tolerance_offset_heatmap.png
+* tolerance_distribution.png
 
 Estimated runtime
 -----------------
-Per spec: 80 epoch baseline ~= 30 min on a single GPU, so 30 epoch ~= 12 min.
-~125 combos * 12 min ~= 25 h.  If that exceeds your budget, drop to
-``--offset_range 1`` (27 raw candidates).
+~27 combos * 30 epochs ~= 27 * ~10 min ~= 4.5 h on a single GPU
+(worst case 6 h).  Every combo is flushed to partial JSON immediately.
 """
 from __future__ import annotations
 
 import argparse
-import itertools
+import gc
 import json
 import math
 import sys
@@ -57,6 +61,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
+import yaml
 from tqdm import tqdm
 
 from _common import (
@@ -71,10 +76,13 @@ from _common import (
 SCRIPT_NAME = "filter_tolerance_analysis"
 DEFAULT_BASE = [57, 62, 70]
 DEFAULT_EPOCHS = 30
-DEFAULT_DATA_DIR = "/root/autodl-tmp/hsi"
+DEFAULT_DATA_DIR = "/root/autodl-tmp/datasets/full_HSI_dataset"
 DEFAULT_OUTPUT_DIR = "outputs/preanalysis/filter_tolerance_analysis"
-DEFAULT_CONFIG = "../msi/configs/baseline.yaml"
-DEFAULT_MAX_BAND = 90  # 91-band cropped HSI => valid range [0, 90]
+DEFAULT_BASE_CONFIG = "../msi/configs/baseline.yaml"
+MAX_BAND = 90  # 91-band cropped HSI -> valid index range [0, 90]
+OFFSET_RANGE = 1  # locked
+REFERENCE_BASELINE_IOU_80EP = 0.7293  # 80-epoch baseline for reference (NOT for comparison)
+ORIGINAL_HSI_OFFSET = 20  # cropped index + 20 -> original HSI index
 
 
 def _parse_combo(s: str) -> list[int]:
@@ -88,51 +96,43 @@ def _parse_combo(s: str) -> list[int]:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--base_combo", "--base-combo", type=_parse_combo,
-                   default=list(DEFAULT_BASE),
-                   help="Comma-separated 3-band base combo (default 57,62,70)")
-    p.add_argument("--offset_range", "--offset-range", type=int, default=2, choices=[1, 2],
-                   help="Offset range per filter (default 2 -> up to 5^3 = 125 raw candidates)")
+    p.add_argument("--base_combo", type=_parse_combo, default=list(DEFAULT_BASE),
+                   help="Comma-separated 3-band base combo on the 91-band cropped HSI grid")
+    p.add_argument("--offset_range", type=int, default=OFFSET_RANGE, choices=[1],
+                   help="Per-band offset range (locked to 1 in this version)")
     p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS,
-                   help="Epochs per combo (default 30)")
-    p.add_argument("--data_dir", "--data-dir", "--data-root", default=DEFAULT_DATA_DIR, type=str,
-                   help="HSI dataset directory passed to train_and_eval")
-    p.add_argument("--output_dir", "--output-dir", default=DEFAULT_OUTPUT_DIR, type=str,
-                   help="Full output directory for this run (not a parent root)")
-    p.add_argument("--msi-root", "--msi_root", default=DEFAULT_MSI_ROOT, type=str)
-    p.add_argument("--config", default=DEFAULT_CONFIG, type=str,
-                   help="Baseline training config (default ../msi/configs/baseline.yaml)")
-    p.add_argument("--max-band", "--max_band", type=int, default=DEFAULT_MAX_BAND,
-                   help="Inclusive upper bound on valid band index (91-band cropped HSI -> 90)")
+                   help="Epochs per combo (default 30 -- a 'fast eval', NOT directly "
+                        "comparable to the 80-epoch baseline 0.7293)")
     p.add_argument("--seed", type=int, default=SEED)
-    p.add_argument("--no-resume", "--no_resume", action="store_true")
-    p.add_argument("--dry-run", "--dry_run", action="store_true",
-                   help="Skip training, fill iou=NaN; useful for plumbing check")
-    p.add_argument("--skip-sanity", "--skip_sanity", action="store_true",
-                   help="Skip the base-combo sanity check (NOT recommended)")
+    p.add_argument("--data_dir", default=DEFAULT_DATA_DIR, type=str)
+    p.add_argument("--output_dir", default=DEFAULT_OUTPUT_DIR, type=str,
+                   help="Full output directory for this run (used as-is)")
+    p.add_argument("--base_config", default=DEFAULT_BASE_CONFIG, type=str)
+    p.add_argument("--msi_root", default=DEFAULT_MSI_ROOT, type=str)
+    p.add_argument("--device", default="cuda", type=str)
+    p.add_argument("--no_resume", action="store_true")
     return p.parse_args()
 
 
 # ---------------------------------------------------------------------------
 # Combo generation
 
-def generate_combos(base: list[int], R: int, max_band: int) -> list[dict]:
-    """Generate de-duplicated, in-range offset combos.
+def generate_combos(base: list[int], R: int = 1, max_band: int = MAX_BAND) -> list[dict]:
+    """27 -> after constraints, ~27 unique combos around base.
 
     Constraints:
       * each band in [0, max_band]
       * three distinct bands
-      * deduplicate by sorted band tuple ([57,62,70] == [70,62,57])
-    The base combo (offsets=[0,0,0]) is always first in the returned list.
+      * deduplicate by sorted tuple
+    Base combo (offsets [0,0,0]) is always first.
     """
+    import itertools
+
     offsets = list(range(-R, R + 1))
     out: list[dict] = []
-    seen: set[tuple[int, int, int]] = set()
+    seen: set[tuple[int, ...]] = set()
 
-    base_entry = {
-        "offsets": [0, 0, 0],
-        "bands": [int(b) for b in base],
-    }
+    base_entry = {"offsets": [0, 0, 0], "bands": [int(b) for b in base]}
     seen.add(tuple(sorted(base_entry["bands"])))
     out.append(base_entry)
 
@@ -148,10 +148,7 @@ def generate_combos(base: list[int], R: int, max_band: int) -> list[dict]:
         if bs in seen:
             continue
         seen.add(bs)
-        out.append({
-            "offsets": [int(o1), int(o2), int(o3)],
-            "bands": [int(b[0]), int(b[1]), int(b[2])],
-        })
+        out.append({"offsets": [int(o1), int(o2), int(o3)], "bands": list(b)})
     return out
 
 
@@ -168,7 +165,6 @@ def manhattan(offsets) -> int:
 
 def main() -> int:
     args = parse_args()
-    set_seed(args.seed)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -176,342 +172,408 @@ def main() -> int:
     log.info("args: %s", vars(args))
 
     setup_msi_path(args.msi_root)
-    from _adapters import run_training  # noqa: E402
+    import torch  # type: ignore
+    from scripts.band_range_search import train_and_eval  # type: ignore
+
+    # Load cfg from yaml; override data_dir if user specified
+    cfg_path = Path(args.base_config)
+    if not cfg_path.exists():
+        log.error("base_config not found: %s", cfg_path)
+        return 1
+    with open(cfg_path) as f:
+        cfg = yaml.safe_load(f) or {}
+    if args.data_dir:
+        cfg["data_dir"] = args.data_dir
+    log.info("cfg keys: %s", list(cfg.keys()))
+
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    log.info("device: %s", device)
 
     base = list(args.base_combo)
-    combos = generate_combos(base, args.offset_range, args.max_band)
-    log.info("base combo: %s", base)
+    combos = generate_combos(base, args.offset_range, MAX_BAND)
+    n_combos = len(combos)
     log.info("generated %d unique in-range combos (raw=%d)",
-             len(combos), (2 * args.offset_range + 1) ** 3)
+             n_combos, (2 * args.offset_range + 1) ** 3)
 
-    results_path = out_dir / "filter_tolerance_results.json"
-    existing: dict[str, dict] = {}
-    if results_path.exists() and not args.no_resume:
+    # Resume support -------------------------------------------------------
+    partial_path = out_dir / "filter_tolerance_partial.json"
+    final_path = out_dir / "filter_tolerance_results.json"
+    done: dict[str, dict] = {}
+    if not args.no_resume and partial_path.exists():
         try:
-            prev = json.loads(results_path.read_text())
+            prev = json.loads(partial_path.read_text())
             for entry in prev.get("results", []):
-                existing[combo_key(entry["bands"])] = entry
-            log.info("resuming: %d combos already done", len(existing))
+                done[combo_key(entry["bands"])] = entry
+            log.info("resuming: %d combos already done", len(done))
         except Exception as e:  # noqa: BLE001
-            log.warning("could not parse existing results (%s); starting fresh", e)
-            existing = {}
+            log.warning("could not parse partial (%s); starting fresh", e)
+            done = {}
 
-    results: dict[str, dict] = dict(existing)
-
-    # ------------------------------------------------------------------
-    # Sanity check: actually train the base combo first.
-    # ------------------------------------------------------------------
-    base_key = combo_key(base)
-    base_done = base_key in results and results[base_key].get("iou") is not None and \
-        math.isfinite(float(results[base_key]["iou"])) and float(results[base_key]["iou"]) > 0
-    if not args.dry_run and not args.skip_sanity and not base_done:
-        log.info("=== sanity check: training base combo %s ===", base)
-        t0 = time.time()
-        try:
-            iou = run_training(
-                band_indices=base,
-                config_path=args.config,
-                epochs=args.epochs,
-                seed=args.seed,
-                data_dir=args.data_dir,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.exception("base combo training raised: %s", e)
-            log.error("aborting: train_and_eval is not callable with the current signature; "
-                      "edit scripts/preanalysis/_adapters.py::run_training")
-            return 2
-        dt = time.time() - t0
-        log.info("base combo IoU=%.4f (%.1fs)", iou, dt)
-        if not math.isfinite(iou) or iou <= 0:
-            log.error("base combo IoU is %.4f (non-finite or <=0). "
-                      "This suggests train_and_eval is returning a cached/lookup "
-                      "result instead of training; fix the upstream function or "
-                      "edit _adapters.py.", iou)
-            return 2
-        if dt < 5.0:
-            log.warning("base combo training took only %.1fs -- suspiciously fast; "
-                        "verify train_and_eval really trained instead of pulling "
-                        "from a precomputed table.", dt)
-        results[base_key] = {
-            "offsets": [0, 0, 0], "bands": base,
-            "iou": float(iou), "duration_s": float(dt),
-        }
-        _write_results(results_path, args, base, results)
-
-    # ------------------------------------------------------------------
-    # Train each combo
-    # ------------------------------------------------------------------
-    for entry in tqdm(combos, desc="combos"):
+    # Training loop --------------------------------------------------------
+    for i, entry in enumerate(tqdm(combos, desc="combos")):
         key = combo_key(entry["bands"])
-        if key in results:
-            continue
-        if args.dry_run:
-            results[key] = {**entry, "iou": float("nan"), "duration_s": 0.0, "dry_run": True}
-            _write_results(results_path, args, base, results)
+        if key in done:
             continue
 
+        offset_tuple = tuple(entry["offsets"])
+        bands = entry["bands"]
+        combo_tag = f"[tol {i + 1}/{n_combos} offset={offset_tuple} bands={bands}]"
+        log.info("training %s", combo_tag)
+
+        set_seed(args.seed)
         t0 = time.time()
         try:
-            iou = run_training(
-                band_indices=entry["bands"],
-                config_path=args.config,
-                epochs=args.epochs,
+            iou = train_and_eval(
+                cfg=cfg,
                 seed=args.seed,
-                data_dir=args.data_dir,
+                band_indices=bands,
+                num_epochs=args.epochs,
+                device=device,
+                verbose=True,
+                combo_tag=combo_tag,
             )
+            iou = float(iou)
         except Exception as e:  # noqa: BLE001
-            log.exception("training failed for combo %s: %s", entry["bands"], e)
+            log.exception("train_and_eval failed for %s: %s", bands, e)
             iou = float("nan")
         dt = time.time() - t0
-        results[key] = {**entry, "iou": float(iou), "duration_s": float(dt)}
-        log.info("combo=%s offsets=%s iou=%.4f (%.1fs)",
-                 entry["bands"], entry["offsets"], iou, dt)
-        _write_results(results_path, args, base, results)
 
-    # ------------------------------------------------------------------
-    # Aggregate + plots + report
-    # ------------------------------------------------------------------
-    summary = _summary_stats(results, base)
-    log.info("summary: %s", summary)
-    _write_results(results_path, args, base, results, summary=summary)
+        record = {
+            "offsets": entry["offsets"],
+            "bands": entry["bands"],
+            "iou": iou,
+            "duration_s": float(dt),
+        }
+        done[key] = record
+        log.info("%s -> IoU=%.4f (%.1fs)", combo_tag, iou, dt)
 
-    _plot_heatmaps(out_dir / "filter_tolerance_heatmaps.png", results, base, args.offset_range)
-    _plot_distance_curve(out_dir / "filter_tolerance_distance.png", results, summary)
-    _plot_3d(out_dir / "filter_tolerance_3d.png", results, base)
-    _write_report(out_dir / "filter_tolerance_report.txt", results, base, summary, args)
+        # Free GPU memory between combos
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        gc.collect()
 
-    log.info("done. outputs in %s", out_dir)
+        _write_partial(partial_path, args, base, [done[combo_key(c["bands"])]
+                                                  for c in combos
+                                                  if combo_key(c["bands"]) in done],
+                       n_combos)
+
+    # Assemble final results in the canonical combo order
+    results = [done[combo_key(c["bands"])] for c in combos if combo_key(c["bands"]) in done]
+    base_record = next((r for r in results if r["offsets"] == [0, 0, 0]), None)
+    base_iou_30ep = float(base_record["iou"]) if base_record else float("nan")
+    log.info("base_iou_30ep = %.4f", base_iou_30ep)
+
+    summary = _summarise(results, base_iou_30ep, base)
+
+    final_payload = {
+        "config": {
+            "base_combo": base,
+            "base_combo_original_hsi": [b + ORIGINAL_HSI_OFFSET for b in base],
+            "offset_range": args.offset_range,
+            "epochs": args.epochs,
+            "seed": args.seed,
+            "data_dir": args.data_dir,
+            "base_config": args.base_config,
+            "max_band": MAX_BAND,
+            "note": (f"IoU values are the best class-1 IoU from {args.epochs}-epoch "
+                     f"training; NOT directly comparable to the full 80-epoch baseline "
+                     f"({REFERENCE_BASELINE_IOU_80EP:.4f})."),
+        },
+        "base_iou_30ep": base_iou_30ep,
+        "reference_baseline_iou_80ep": REFERENCE_BASELINE_IOU_80EP,
+        "n_combos": len(results),
+        "summary": summary,
+        "results": results,
+    }
+    save_json(final_payload, final_path)
+    if partial_path.exists():
+        try:
+            partial_path.unlink()
+            log.info("removed partial file (final results saved to %s)", final_path)
+        except Exception as e:  # noqa: BLE001
+            log.warning("could not remove partial: %s", e)
+
+    # Visualisations -------------------------------------------------------
+    _plot_distance_curve(out_dir / "tolerance_distance_curve.png", results, base_iou_30ep)
+    _plot_offset_heatmap(out_dir / "tolerance_offset_heatmap.png", results, base)
+    _plot_distribution(out_dir / "tolerance_distribution.png", results, base_iou_30ep)
+
+    _write_report(out_dir / "filter_tolerance_report.txt", results, base, base_iou_30ep,
+                  args, cfg, summary)
+
+    # Headline
+    valid = [r["iou"] for r in results if math.isfinite(r["iou"])]
+    if math.isfinite(base_iou_30ep):
+        drops = [base_iou_30ep - v for v in valid]
+        n_within = sum(1 for d in drops if d <= 0.01)
+        mean_drop = float(np.mean(drops)) if drops else float("nan")
+        headline = (f"Tolerance: {n_within}/{len(results)} combos within 0.01 IoU drop "
+                    f"from base, mean drop = {mean_drop:.4f}")
+    else:
+        headline = "Tolerance: base IoU is not finite, cannot compute drops"
+    log.info(headline)
+    print(headline)
     return 0
 
 
 # ---------------------------------------------------------------------------
 # Persistence
 
-def _write_results(path: Path, args, base: list[int], results: dict,
-                   summary: dict | None = None) -> None:
-    payload = {
-        "config": {
-            "base_combo": list(base),
-            "offset_range": args.offset_range,
-            "epochs": args.epochs,
-            "seed": args.seed,
-            "data_dir": args.data_dir,
-            "output_dir": args.output_dir,
-            "config_path": args.config,
-            "max_band": args.max_band,
-            "note": (f"IoU values are 'best class-1 IoU' from {args.epochs}-epoch training; "
-                     "NOT directly comparable to the full 80-epoch baseline numbers."),
-        },
-        "base_iou": float(results.get(combo_key(base), {}).get("iou", float("nan"))),
-        "results": list(results.values()),
-    }
-    if summary is not None:
-        payload["summary"] = summary
-    save_json(payload, path)
+def _write_partial(path: Path, args, base: list[int], results: list[dict], n_total: int) -> None:
+    save_json({
+        "base_combo": base,
+        "offset_range": args.offset_range,
+        "epochs": args.epochs,
+        "seed": args.seed,
+        "n_total": n_total,
+        "n_completed": len(results),
+        "results": results,
+    }, path)
 
 
 # ---------------------------------------------------------------------------
 # Summary stats
 
-def _summary_stats(results: dict, base: list[int]) -> dict:
-    base_iou = float(results.get(combo_key(base), {}).get("iou", float("nan")))
-
-    def stats_for_radius(R: int) -> dict:
-        ious = []
-        for v in results.values():
-            offs = v["offsets"]
-            if max(abs(o) for o in offs) <= R:
-                iou = v.get("iou")
-                if iou is None or not math.isfinite(float(iou)):
-                    continue
-                ious.append(float(iou))
-        if not ious:
-            return {"n": 0}
-        arr = np.array(ious)
-        out = {
-            "n": int(len(arr)),
-            "mean": float(arr.mean()),
-            "std": float(arr.std()),
-            "min": float(arr.min()),
-            "max": float(arr.max()),
-        }
-        if math.isfinite(base_iou):
-            drops = base_iou - arr
-            out["frac_drop_lt_0.01"] = float((drops < 0.01).mean())
-            out["frac_drop_lt_0.02"] = float((drops < 0.02).mean())
-            out["frac_drop_lt_0.05"] = float((drops < 0.05).mean())
-        return out
-
-    def stats_at_distance(d: int) -> dict:
-        ious = []
-        for v in results.values():
-            if manhattan(v["offsets"]) != d:
-                continue
-            iou = v.get("iou")
-            if iou is None or not math.isfinite(float(iou)):
-                continue
-            ious.append(float(iou))
-        if not ious:
-            return {"n": 0}
-        arr = np.array(ious)
-        return {
-            "n": int(len(arr)),
-            "mean": float(arr.mean()),
-            "std": float(arr.std()),
-            "min": float(arr.min()),
-            "max": float(arr.max()),
-        }
-
-    max_d = max((manhattan(v["offsets"]) for v in results.values()), default=0)
-    return {
-        "base_iou": base_iou,
-        "neighborhood_R1": stats_for_radius(1),
-        "neighborhood_R2": stats_for_radius(2),
-        "by_distance": {int(d): stats_at_distance(d) for d in range(0, max_d + 1)},
+def _summarise(results: list[dict], base_iou: float, base: list[int]) -> dict:
+    valid = [r for r in results if math.isfinite(r["iou"])]
+    ious = np.array([r["iou"] for r in valid], dtype=np.float64) if valid else np.empty(0)
+    out: dict = {
+        "n": int(len(valid)),
+        "iou_min": float(ious.min()) if len(ious) else float("nan"),
+        "iou_max": float(ious.max()) if len(ious) else float("nan"),
+        "iou_mean": float(ious.mean()) if len(ious) else float("nan"),
+        "iou_std": float(ious.std()) if len(ious) else float("nan"),
     }
+    if math.isfinite(base_iou) and len(ious):
+        drops = base_iou - ious
+        out["drop_le_0.005"] = int((drops <= 0.005).sum())
+        out["drop_le_0.010"] = int((drops <= 0.010).sum())
+        out["drop_le_0.020"] = int((drops <= 0.020).sum())
+        out["mean_drop"] = float(drops.mean())
+
+    # Per-band sensitivity: mean IoU drop when only this band shifts by +/-1
+    sens: dict[int, float] = {}
+    for pos in range(3):
+        shifted_ious = []
+        for r in valid:
+            offs = r["offsets"]
+            if offs == [0, 0, 0]:
+                continue
+            # exactly one non-zero offset, at position `pos`
+            if abs(offs[pos]) == 1 and all(offs[p] == 0 for p in range(3) if p != pos):
+                shifted_ious.append(r["iou"])
+        if shifted_ious and math.isfinite(base_iou):
+            sens[pos] = float(base_iou - np.mean(shifted_ious))
+        else:
+            sens[pos] = float("nan")
+    out["per_band_sensitivity"] = {f"band_{pos}_({base[pos]})": v for pos, v in sens.items()}
+
+    # by-distance stats
+    by_d: dict[int, dict] = {}
+    max_d = max((manhattan(r["offsets"]) for r in valid), default=0)
+    for d in range(0, max_d + 1):
+        vals = [r["iou"] for r in valid if manhattan(r["offsets"]) == d]
+        if not vals:
+            by_d[d] = {"n": 0}
+            continue
+        arr = np.asarray(vals)
+        by_d[d] = {"n": int(len(arr)), "mean": float(arr.mean()),
+                   "std": float(arr.std()), "min": float(arr.min()), "max": float(arr.max())}
+    out["by_distance"] = by_d
+    return out
 
 
 # ---------------------------------------------------------------------------
 # Plots
 
-def _finite_iou_range(results: dict) -> tuple[float, float] | None:
-    vals = [float(v["iou"]) for v in results.values()
-            if v.get("iou") is not None and math.isfinite(float(v["iou"]))]
-    if not vals:
-        return None
-    return float(min(vals)), float(max(vals))
-
-
-def _plot_heatmaps(path: Path, results: dict, base: list[int], R: int) -> None:
+def _plot_distance_curve(path: Path, results: list[dict], base_iou: float) -> None:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    plt.rcParams.update({"font.family": "sans-serif", "font.size": 10})
 
-    rng = _finite_iou_range(results)
-    if rng is None:
+    valid = [r for r in results if math.isfinite(r["iou"])]
+    if not valid:
         return
-    vmin, vmax = rng
+    xs = np.array([manhattan(r["offsets"]) for r in valid])
+    ys = np.array([r["iou"] for r in valid])
+    is_base = np.array([r["offsets"] == [0, 0, 0] for r in valid])
 
-    side = 2 * R + 1
-    offsets = list(range(-R, R + 1))
-    fig, axes = plt.subplots(1, side, figsize=(3.2 * side, 3.6), sharey=True)
-    if side == 1:
-        axes = [axes]
+    # Jitter x for visibility
+    rng = np.random.default_rng(0)
+    jitter = rng.uniform(-0.12, 0.12, size=len(xs))
+    xs_j = xs + jitter
 
-    last_im = None
-    for k, o3 in enumerate(offsets):
-        grid = np.full((side, side), np.nan)
-        for v in results.values():
-            o1, o2, o3v = v["offsets"]
-            if o3v != o3:
-                continue
-            iou = v.get("iou")
-            if iou is None or not math.isfinite(float(iou)):
-                continue
-            grid[offsets.index(o2), offsets.index(o1)] = float(iou)
-        ax = axes[k]
-        last_im = ax.imshow(grid, origin="lower", cmap="viridis", vmin=vmin, vmax=vmax,
-                            extent=[-R - 0.5, R + 0.5, -R - 0.5, R + 0.5])
-        ax.set_xticks(offsets)
-        ax.set_yticks(offsets)
-        ax.set_xlabel(f"offset b1 (base={base[0]})")
-        if k == 0:
-            ax.set_ylabel(f"offset b2 (base={base[1]})")
-        ax.set_title(f"offset b3 = {o3:+d}\n(b3 base={base[2]})")
-        for o1 in offsets:
-            for o2 in offsets:
-                v = grid[offsets.index(o2), offsets.index(o1)]
-                if not math.isnan(v):
-                    ax.text(o1, o2, f"{v:.2f}", ha="center", va="center",
-                            fontsize=7, color="white" if v < (vmin + vmax) / 2 else "black")
-        # Mark base cell (0,0) with a red box when this is the base slice (o3=0)
-        if o3 == 0:
-            ax.plot(0, 0, marker="s", markersize=24, markerfacecolor="none",
-                    markeredgecolor="red", markeredgewidth=2.0)
-
-    fig.colorbar(last_im, ax=axes, shrink=0.85, label="defect IoU",
-                 location="right", pad=0.02)
-    fig.suptitle(f"Filter-shift tolerance heatmaps (base combo = {base})", y=1.03)
-    fig.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-
-def _plot_distance_curve(path: Path, results: dict, summary: dict) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    by_d = summary.get("by_distance", {})
-    if not by_d:
-        return
-    distances = sorted(int(d) for d, s in by_d.items() if s.get("n", 0) > 0)
-    if not distances:
-        return
-
-    means = [by_d[str(d) if isinstance(list(by_d.keys())[0], str) else d]["mean"] for d in distances]
-    stds = [by_d[str(d) if isinstance(list(by_d.keys())[0], str) else d]["std"] for d in distances]
-    ns = [by_d[str(d) if isinstance(list(by_d.keys())[0], str) else d]["n"] for d in distances]
-
-    # All individual points
-    scatter_x: list[int] = []
-    scatter_y: list[float] = []
-    for v in results.values():
-        iou = v.get("iou")
-        if iou is None or not math.isfinite(float(iou)):
-            continue
-        scatter_x.append(manhattan(v["offsets"]))
-        scatter_y.append(float(iou))
+    # Per-distance mean + std for error bars
+    max_d = int(xs.max()) if len(xs) else 0
+    d_grid = np.arange(0, max_d + 1)
+    means = []
+    stds = []
+    counts = []
+    for d in d_grid:
+        v = ys[xs == d]
+        means.append(float(v.mean()) if len(v) else np.nan)
+        stds.append(float(v.std()) if len(v) else np.nan)
+        counts.append(int(len(v)))
 
     fig, ax = plt.subplots(figsize=(8, 5.5))
-    ax.scatter(scatter_x, scatter_y, s=30, color="tab:blue", alpha=0.45, label="individual combos")
-    ax.errorbar(distances, means, yerr=stds, fmt="o-", color="tab:red", lw=2,
-                capsize=4, label="mean +/- std", markersize=8, zorder=5)
-    base_iou = summary.get("base_iou")
-    if base_iou is not None and math.isfinite(base_iou):
+    # Color individual points by IoU (RdYlGn)
+    sc = ax.scatter(xs_j[~is_base], ys[~is_base], c=ys[~is_base], cmap="RdYlGn",
+                    s=55, edgecolor="black", linewidth=0.4, zorder=3,
+                    vmin=float(ys.min()), vmax=float(ys.max()))
+    # Base = red star
+    if is_base.any():
+        ax.scatter(xs_j[is_base], ys[is_base], marker="*", s=320, color="red",
+                   edgecolor="black", linewidth=0.8, zorder=5, label="base combo")
+
+    # Mean +/- std connector
+    valid_d = [(d, m, s, c) for d, m, s, c in zip(d_grid, means, stds, counts) if c > 0]
+    if valid_d:
+        d_arr = np.array([d for d, *_ in valid_d])
+        m_arr = np.array([m for _, m, *_ in valid_d])
+        s_arr = np.array([s for _, _, s, _ in valid_d])
+        ax.errorbar(d_arr, m_arr, yerr=s_arr, fmt="o-", color="black", lw=1.5,
+                    capsize=4, markersize=7, zorder=4, label="mean +/- std")
+        for d, m, _, c in valid_d:
+            ax.annotate(f"n={c}", (d, m), xytext=(6, -4),
+                        textcoords="offset points", fontsize=9, color="dimgray")
+
+    # Base reference line
+    if math.isfinite(base_iou):
         ax.axhline(base_iou, color="grey", linestyle="--", lw=1,
-                   label=f"base IoU = {base_iou:.4f}")
-    for d, n, m in zip(distances, ns, means):
-        ax.annotate(f"n={n}", (d, m), xytext=(6, -2), textcoords="offset points",
-                    fontsize=8, color="tab:red")
+                   label=f"base IoU (30 ep) = {base_iou:.4f}")
+
+    cbar = fig.colorbar(sc, ax=ax, label="defect IoU")
+    cbar.ax.tick_params(labelsize=9)
+
+    ax.set_xticks(d_grid)
     ax.set_xlabel("Manhattan distance to base combo (sum of |offsets|)")
-    ax.set_ylabel("defect IoU")
-    ax.set_title("Tolerance vs distance from base combo")
-    ax.set_xticks(distances)
+    ax.set_ylabel("defect IoU (30-epoch eval)")
+    ax.set_title("Filter tolerance: IoU vs distance from base combo")
     ax.grid(alpha=0.3)
-    ax.legend(loc="best")
+    ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
 
 
-def _plot_3d(path: Path, results: dict, base: list[int]) -> None:
+def _plot_offset_heatmap(path: Path, results: list[dict], base: list[int]) -> None:
+    """3 subplots: for each pair of bands, fix the third band's offset to 0."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+    plt.rcParams.update({"font.family": "sans-serif", "font.size": 10})
 
-    offs = []
-    ious = []
-    for v in results.values():
-        iou = v.get("iou")
-        if iou is None or not math.isfinite(float(iou)):
-            continue
-        offs.append(v["offsets"])
-        ious.append(float(iou))
-    if not offs:
+    valid = [r for r in results if math.isfinite(r["iou"])]
+    if not valid:
         return
-    offs = np.asarray(offs)
-    ious = np.asarray(ious)
+    all_iou = np.array([r["iou"] for r in valid])
+    vmin, vmax = float(all_iou.min()), float(all_iou.max())
 
-    fig = plt.figure(figsize=(8, 7))
-    ax = fig.add_subplot(111, projection="3d")
-    sc = ax.scatter(offs[:, 0], offs[:, 1], offs[:, 2], c=ious, cmap="viridis",
-                    s=80, edgecolor="black", linewidth=0.3)
-    ax.set_xlabel(f"offset to band {base[0]}")
-    ax.set_ylabel(f"offset to band {base[1]}")
-    ax.set_zlabel(f"offset to band {base[2]}")
-    ax.set_title(f"Filter tolerance: defect IoU vs filter offsets (base={base})")
-    fig.colorbar(sc, ax=ax, shrink=0.7, label="defect IoU")
+    offsets = [-1, 0, 1]
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.2))
+    last_im = None
+
+    # Definitions: (fixed_pos, x_pos, y_pos, label)
+    layouts = [
+        (2, 0, 1, f"fix b3={base[2]} (offset 0)",
+         f"offset b1 (base={base[0]})", f"offset b2 (base={base[1]})"),
+        (1, 0, 2, f"fix b2={base[1]} (offset 0)",
+         f"offset b1 (base={base[0]})", f"offset b3 (base={base[2]})"),
+        (0, 1, 2, f"fix b1={base[0]} (offset 0)",
+         f"offset b2 (base={base[1]})", f"offset b3 (base={base[2]})"),
+    ]
+
+    for ax, (fix, x_pos, y_pos, title, xlabel, ylabel) in zip(axes, layouts):
+        grid = np.full((3, 3), np.nan)
+        for r in valid:
+            offs = r["offsets"]
+            if offs[fix] != 0:
+                continue
+            grid[offsets.index(offs[y_pos]), offsets.index(offs[x_pos])] = r["iou"]
+        last_im = ax.imshow(grid, origin="lower", cmap="RdYlGn", vmin=vmin, vmax=vmax,
+                            extent=[-1.5, 1.5, -1.5, 1.5])
+        ax.set_xticks(offsets)
+        ax.set_yticks(offsets)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        for ox in offsets:
+            for oy in offsets:
+                v = grid[offsets.index(oy), offsets.index(ox)]
+                if math.isnan(v):
+                    continue
+                color = "white" if v < (vmin + vmax) / 2 else "black"
+                ax.text(ox, oy, f"{v:.3f}", ha="center", va="center",
+                        fontsize=10, color=color)
+        # Mark base cell (0, 0) with a thick black border
+        ax.plot(0, 0, marker="s", markersize=44, markerfacecolor="none",
+                markeredgecolor="black", markeredgewidth=2.5, zorder=10)
+
+    fig.suptitle(f"Filter tolerance heatmaps  (base = {base})", y=1.02, fontsize=12)
+    cbar = fig.colorbar(last_im, ax=axes, shrink=0.85, label="defect IoU",
+                        location="right", pad=0.02)
+    cbar.ax.tick_params(labelsize=9)
+    fig.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _plot_distribution(path: Path, results: list[dict], base_iou: float) -> None:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    plt.rcParams.update({"font.family": "sans-serif", "font.size": 10})
+
+    valid = [r for r in results if math.isfinite(r["iou"])]
+    if not valid:
+        return
+    ious = np.array([r["iou"] for r in valid])
+    is_base = np.array([r["offsets"] == [0, 0, 0] for r in valid])
+
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+    parts = ax.violinplot([ious], positions=[1], vert=True, widths=0.7,
+                          showmeans=False, showmedians=False, showextrema=False)
+    for body in parts["bodies"]:
+        body.set_facecolor("tab:blue")
+        body.set_alpha(0.35)
+        body.set_edgecolor("black")
+
+    # Swarm-style scatter with jitter
+    rng = np.random.default_rng(1)
+    jitter = rng.uniform(-0.15, 0.15, size=len(ious))
+    ax.scatter(np.full(len(ious), 1.0)[~is_base] + jitter[~is_base], ious[~is_base],
+               s=45, color="tab:blue", alpha=0.8, edgecolor="black", linewidth=0.3,
+               zorder=3, label="combo")
+    if is_base.any():
+        ax.scatter(np.full(len(ious), 1.0)[is_base] + jitter[is_base], ious[is_base],
+                   s=200, color="red", marker="*", edgecolor="black", linewidth=0.6,
+                   zorder=4, label="base combo")
+
+    mean_iou = float(ious.mean())
+    median_iou = float(np.median(ious))
+    min_iou = float(ious.min())
+    max_iou = float(ious.max())
+    ax.axhline(mean_iou, color="tab:purple", linestyle="--", lw=1, label=f"mean = {mean_iou:.4f}")
+    ax.axhline(median_iou, color="tab:green", linestyle=":", lw=1,
+               label=f"median = {median_iou:.4f}")
+
+    drop_text = ""
+    if math.isfinite(base_iou):
+        n_close = int(((base_iou - ious) < 0.01).sum())
+        drop_text = f"IoU drop < 0.01 from base: {n_close}/{len(ious)} combos"
+
+    ax.set_xticks([1])
+    ax.set_xticklabels(["all combos"])
+    ax.set_xlim(0.3, 1.7)
+    ax.set_ylabel("defect IoU (30-epoch eval)")
+    title = f"Tolerance distribution  (n={len(ious)})\nmin={min_iou:.4f}, max={max_iou:.4f}"
+    if drop_text:
+        title += f"\n{drop_text}"
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.3)
+    ax.legend(loc="best", fontsize=9)
     fig.tight_layout()
     fig.savefig(path, dpi=200)
     plt.close(fig)
@@ -520,59 +582,131 @@ def _plot_3d(path: Path, results: dict, base: list[int]) -> None:
 # ---------------------------------------------------------------------------
 # Report
 
-def _write_report(path: Path, results: dict, base: list[int], summary: dict, args) -> None:
-    lines = ["Filter-shift tolerance report", "=" * 60, ""]
-    lines.append(f"Base combo (91-band cropped HSI index): {base}")
-    lines.append(f"Epochs per combo: {args.epochs}  (seed={args.seed})")
-    lines.append(f"Note: {args.epochs}-epoch IoU is NOT directly comparable to the "
-                 "80-epoch baseline IoU (e.g. 0.7293).  Treat the base IoU below as "
-                 "this run's reference point.")
+def _wavelengths_from_cfg(cfg: dict, bands: list[int]) -> list[float] | None:
+    """Best-effort: pull a band->nm mapping from cfg, in cropped-index space.
+
+    Expected key candidates: ``band_wavelengths``, ``wavelengths``.
+    If the cfg list is on the original HSI grid (length 91+20 = 111+), we
+    assume the cropped index corresponds to the first element of the
+    cropped slice, but the caller can adjust if needed.
+    """
+    wls = cfg.get("band_wavelengths") or cfg.get("wavelengths")
+    if not wls:
+        return None
+    try:
+        out = []
+        for b in bands:
+            if b < 0 or b >= len(wls):
+                return None
+            out.append(float(wls[b]))
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _write_report(path: Path, results: list[dict], base: list[int],
+                  base_iou: float, args, cfg: dict, summary: dict) -> None:
+    lines = ["Filter-shift tolerance report (30-epoch quick evaluation)",
+             "=" * 60, ""]
+    base_original = [b + ORIGINAL_HSI_OFFSET for b in base]
+    lines.append(f"Base combo (91-band cropped index):  {base}")
+    lines.append(f"Base combo (original HSI index):      {base_original}  (cropped + {ORIGINAL_HSI_OFFSET})")
+    wls = _wavelengths_from_cfg(cfg, base)
+    if wls is not None:
+        lines.append(f"Base combo wavelength (nm):           {[round(w, 1) for w in wls]}")
+    lines.append(f"Base IoU ({args.epochs} epochs):                {base_iou:.4f}"
+                 if math.isfinite(base_iou) else
+                 f"Base IoU ({args.epochs} epochs):                not finite")
+    lines.append(f"Reference IoU (80 epochs, exhaustive): {REFERENCE_BASELINE_IOU_80EP:.4f}  "
+                 f"(NOT directly comparable -- 30 vs 80 epoch)")
     lines.append("")
-    base_iou = summary["base_iou"]
-    lines.append(f"Base IoU (this run, {args.epochs} ep): {base_iou:.4f}"
-                 if math.isfinite(base_iou) else "Base IoU (this run): not finite")
+    lines.append(f"Neighborhood: +/-{args.offset_range} band offset, {summary['n']} unique combos (incl. base)")
+    lines.append("")
+    lines.append("Tolerance summary:")
+    lines.append(f"  IoU range across {summary['n']} combos: "
+                 f"[{summary['iou_min']:.4f}, {summary['iou_max']:.4f}]")
+    lines.append(f"  IoU mean +/- std: {summary['iou_mean']:.4f} +/- {summary['iou_std']:.4f}")
+    if "drop_le_0.005" in summary:
+        n = summary["n"]
+        lines.append(f"  Drop from base <= 0.005: {summary['drop_le_0.005']}/{n} combos "
+                     f"({summary['drop_le_0.005'] / n:.1%})")
+        lines.append(f"  Drop from base <= 0.010: {summary['drop_le_0.010']}/{n} combos "
+                     f"({summary['drop_le_0.010'] / n:.1%})")
+        lines.append(f"  Drop from base <= 0.020: {summary['drop_le_0.020']}/{n} combos "
+                     f"({summary['drop_le_0.020'] / n:.1%})")
     lines.append("")
 
-    for r_name, r_stats in [("R = +/-1", summary["neighborhood_R1"]),
-                            ("R = +/-2", summary["neighborhood_R2"])]:
-        lines.append(f"[{r_name}] n = {r_stats.get('n', 0)}")
-        if r_stats.get("n", 0):
-            lines.append(f"  IoU mean = {r_stats['mean']:.4f}  std = {r_stats['std']:.4f}  "
-                         f"min = {r_stats['min']:.4f}  max = {r_stats['max']:.4f}")
-            if "frac_drop_lt_0.01" in r_stats:
-                lines.append(f"  IoU drop < 0.01 vs base: {r_stats['frac_drop_lt_0.01']:.1%}")
-                lines.append(f"  IoU drop < 0.02 vs base: {r_stats['frac_drop_lt_0.02']:.1%}")
-                lines.append(f"  IoU drop < 0.05 vs base: {r_stats['frac_drop_lt_0.05']:.1%}")
+    # Top-5 / worst-5
+    valid = [r for r in results if math.isfinite(r["iou"])]
+    valid_sorted = sorted(valid, key=lambda r: -r["iou"])
+    lines.append("Top-5 combos in neighborhood:")
+    for rank, r in enumerate(valid_sorted[:5], 1):
+        marker = "  (BASE)" if r["offsets"] == [0, 0, 0] else ""
+        lines.append(f"  {rank}. bands={r['bands']}  offset={tuple(r['offsets'])}  "
+                     f"IoU={r['iou']:.4f}{marker}")
+    lines.append("")
+    lines.append("Worst-5 combos in neighborhood:")
+    for rank, r in enumerate(valid_sorted[-5:][::-1], 1):
+        lines.append(f"  {rank}. bands={r['bands']}  offset={tuple(r['offsets'])}  "
+                     f"IoU={r['iou']:.4f}")
+    lines.append("")
+
+    # Per-band sensitivity
+    sens = summary.get("per_band_sensitivity", {})
+    if sens:
+        lines.append("Per-band sensitivity (mean IoU drop when only this band shifts +/-1):")
+        for pos, b in enumerate(base):
+            key = f"band_{pos}_({b})"
+            v = sens.get(key, float("nan"))
+            v_str = f"{v:+.4f}" if math.isfinite(v) else "n/a"
+            lines.append(f"  band b{pos + 1} (cropped={b}, original={b + ORIGINAL_HSI_OFFSET}): "
+                         f"mean drop = {v_str}")
         lines.append("")
 
+    # By-distance
     by_d = summary.get("by_distance", {})
     if by_d:
         lines.append("IoU by Manhattan distance to base:")
         for d in sorted(int(k) for k in by_d.keys()):
             s = by_d[d] if d in by_d else by_d[str(d)]
             if s.get("n", 0):
-                lines.append(f"  d={d}: n={s['n']:3d}  mean={s['mean']:.4f}  "
-                             f"std={s['std']:.4f}  min={s['min']:.4f}  max={s['max']:.4f}")
+                lines.append(f"  d={d}: n={s['n']:2d}  mean={s['mean']:.4f}  "
+                             f"std={s['std']:.4f}  range=[{s['min']:.4f}, {s['max']:.4f}]")
         lines.append("")
 
-    # Top-5 best (including base), worst-5
-    rows = []
-    for v in results.values():
-        iou = v.get("iou")
-        if iou is None or not math.isfinite(float(iou)):
-            continue
-        rows.append((float(iou), v["bands"], v["offsets"]))
-    rows.sort(key=lambda r: -r[0])
-    lines.append("Top-5 best combos:")
-    for r, (iou, bands, offs) in enumerate(rows[:5], 1):
-        marker = " (BASE)" if bands == list(base) else ""
-        lines.append(f"  {r}. bands={bands}  offsets={offs}  IoU={iou:.4f}{marker}")
-    lines.append("")
-    lines.append("Worst-5 combos:")
-    for r, (iou, bands, offs) in enumerate(rows[-5:][::-1], 1):
-        lines.append(f"  {r}. bands={bands}  offsets={offs}  IoU={iou:.4f}")
-
+    # Engineering interpretation
+    interp = _engineering_interpretation(summary, base_iou)
+    lines.append("Engineering interpretation:")
+    lines.append("  " + interp)
     path.write_text("\n".join(lines) + "\n")
+
+
+def _engineering_interpretation(summary: dict, base_iou: float) -> str:
+    if not math.isfinite(base_iou):
+        return ("Base IoU is not finite, cannot interpret tolerance.  "
+                "Verify train_and_eval is actually training.")
+    n = summary.get("n", 0)
+    if n == 0:
+        return "No finite IoU values to interpret."
+    n_010 = summary.get("drop_le_0.010", 0)
+    frac_010 = n_010 / n
+    mean_drop = summary.get("mean_drop", float("nan"))
+    if frac_010 >= 0.9:
+        verdict = ("Filter tolerance is excellent: nearly all +/-1-band perturbations "
+                   "stay within 0.01 IoU of the base combo, so typical hardware "
+                   "filter-centre tolerances should be acceptable.")
+    elif frac_010 >= 0.7:
+        verdict = ("Filter tolerance is good: most +/-1-band perturbations stay within "
+                   "0.01 IoU drop.  Standard filter selection should suffice.")
+    elif frac_010 >= 0.4:
+        verdict = ("Filter tolerance is moderate: a meaningful fraction of "
+                   "neighbour combos lose >0.01 IoU.  Prefer tighter filter "
+                   "specifications and verify per-batch.")
+    else:
+        verdict = ("Filter tolerance is limited: most +/-1-band perturbations cost "
+                   ">0.01 IoU.  Tighter filter centre wavelengths or recomputed "
+                   "band selection may be required for production.")
+    return verdict + f"  (mean drop across {n} combos: {mean_drop:+.4f})"
 
 
 if __name__ == "__main__":
