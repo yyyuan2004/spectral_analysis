@@ -16,7 +16,8 @@ spectral_analysis/
 │   ├── bootstrap_band_stability.py           # A2
 │   ├── error_distance_to_boundary.py         # A4
 │   ├── single_band_ablation.py               # A5
-│   └── filter_tolerance_analysis.py          # A3
+│   ├── filter_tolerance_analysis.py          # A3
+│   └── band_selection_spa_cars_mi.py         # SPA / CARS / MI feature selection
 ├── run_preanalysis.sh                      # driver
 └── requirements.txt
 ```
@@ -71,6 +72,13 @@ python scripts/preanalysis/filter_tolerance_analysis.py --base-combo 77 82 90
 
 # all at once (A0 is a no-op)
 ./run_preanalysis.sh --task all
+
+# SPA / CARS / MI feature band selection (~1-5 min on a CPU)
+# Only needs images/ and masks/ -- no whole/ required.
+python scripts/preanalysis/band_selection_spa_cars_mi.py \
+    --images-dir "C:/Users/10730/Desktop/hsi(20-110)/images" \
+    --masks-dir  "C:/Users/10730/Desktop/hsi(20-110)/masks" \
+    --n-select 10
 ```
 
 ## Notes on the design
